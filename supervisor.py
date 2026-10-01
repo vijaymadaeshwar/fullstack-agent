@@ -222,7 +222,18 @@ def kill(pids: list[int]) -> None:
 
 
 def spawn(cmd: str, cwd: str) -> None:
-    subprocess.Popen(cmd, cwd=cwd, shell=True, creationflags=CREATE_NO_WINDOW, **DETACH)
+    # Strip the server-auth variables before anything is launched. If they
+    # are set in the environment, `opencode serve` turns on HTTP Basic auth
+    # and every later request 401s -- including the brain's own client,
+    # which talks to it unauthenticated on loopback. The brain clears these
+    # for the server it starts itself (brain.py does the same); the
+    # supervisor has to do it too, or it hands back a brain nobody can talk
+    # to every time it restarts one.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("OPENCODE_SERVER_PASSWORD", "OPENCODE_SERVER_USERNAME")}
+    env["OPENCODE_CLIENT"] = "supervisor"
+    subprocess.Popen(cmd, cwd=cwd, env=env, shell=True,
+                     creationflags=CREATE_NO_WINDOW, **DETACH)
 
 
 def owner_of(port: int) -> int:
@@ -245,11 +256,20 @@ def http_ok(port: int, path: str, timeout: float = 6.0) -> bool:
     would report "healthy" for a face that stopped rendering or a brain
     that stopped answering -- and the supervisor would happily leave it
     that way forever. Ask for real bytes instead.
+
+    ANY HTTP status counts as alive, including 401. A server that answers
+    "Unauthorized" is very much running; it is telling us the caller needs
+    a credential, which is the application's business, not a reason to
+    declare it dead and restart it in a loop. Only a refused connection, a
+    timeout, or garbage means dead.
     """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
                                     timeout=timeout) as r:
-            return r.status == 200 and bool(r.read(64))
+            r.read(64)
+            return True
+    except urllib.error.HTTPError:
+        return True          # it spoke HTTP; it is alive
     except Exception:
         return False
 
@@ -321,11 +341,21 @@ def ensure_voice() -> None:
 
 
 def known_models() -> set:
-    """Full 'provider/model_id' refs the brain can actually serve right now."""
-    import urllib.request
-    with urllib.request.urlopen(
-            f"http://127.0.0.1:{BRAIN_PORT}/config/providers", timeout=20) as r:
-        data = json.load(r)
+    """Full 'provider/model_id' refs the brain can actually serve right now.
+
+    Returns an empty set if the brain cannot be asked -- down, starting, or
+    refusing the request. An empty set means "unknown", never "the model is
+    gone": repair_model() must not rewrite the config on a guess.
+    """
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{BRAIN_PORT}/config/providers",
+                timeout=20) as r:
+            data = json.load(r)
+    except Exception:
+        return set()
+    if not isinstance(data, (dict, list)):
+        return set()
     out = set()
     for p in data.get("providers", data if isinstance(data, list) else []):
         models = p.get("models") or {}
@@ -341,6 +371,13 @@ def repair_model() -> None:
     """A model that has vanished from the provider is the one failure the
     user cannot work around by talking. Rewrite the config to the known-good
     model and let the voice pick it up on its next start."""
+    # Ask once, and give up if the brain will not answer. Without this a
+    # brain that is merely restarting (or refusing us) looks exactly like
+    # "no models offered", and the config gets quietly rewritten to the
+    # fallback -- turning a 20-second outage into a permanent model change.
+    offered = known_models()
+    if not offered:
+        return
     try:
         with open(BACKTALK_JSON, encoding="utf-8") as f:
             cfg = json.load(f)
@@ -349,11 +386,11 @@ def repair_model() -> None:
     model = cfg.get("model")
     if not model:
         return
-    if model in known_models():
+    if model in offered:
         return
     say(f"model {model!r} is no longer offered, switching to {FALLBACK_MODEL}")
     cfg["model"] = FALLBACK_MODEL
-    if cfg.get("deep_model") and cfg["deep_model"] not in known_models():
+    if cfg.get("deep_model") and cfg["deep_model"] not in offered:
         cfg["deep_model"] = FALLBACK_MODEL
     try:
         tmp = BACKTALK_JSON + ".tmp"
