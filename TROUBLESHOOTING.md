@@ -37,6 +37,16 @@ The wiring is one config line, plus a restart. Check both:
 
 While the agent speaks, the backtalk folder should contain fresh `.voice_state` and `.voice_waveform` files. If they are not appearing, the problem is on the voice side; work backtalk's own guide.
 
+## Some languages come out in an English accent, or not at all
+
+Kokoro ships 54 voices across 9 languages (both English accents, Spanish, French, Hindi, Italian, Japanese, Portuguese, Mandarin). Anything outside that set is handled by **espeak-ng**, which covers around 100 languages including Tamil, Korean, Arabic, Russian, Thai and German. If espeak-ng is missing, those languages silently fall back to being read in English:
+
+```
+"C:\Program Files\eSpeak NG\espeak-ng.exe" --voices
+```
+
+If that fails, install it — the voice log will say `espeak-ng` is absent, or the words will come out with a wrong accent. On Windows: `winget install eSpeak-NG.eSpeak-NG`. On macOS: `brew install espeak-ng`. On Debian/Ubuntu: `sudo apt install espeak-ng`. It is also a hard requirement of Kokoro's phonemizer, so most installs already have it.
+
 ## The greeting doesn't speak on launch
 
 The greeting line lives in `backtalk/backtalk.json` under `"greeting"`. If it is missing or empty, the launch is silent by configuration. The voice piece itself failing to start is a different problem; its terminal output says why, and its guide covers the classics.
