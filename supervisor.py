@@ -4,7 +4,8 @@ Checks, on a loop:
   1. the opencode brain   (port 4599)
   2. the ai-visualizer face (port 8790)
   3. the backtalk voice
-  4. a turn that is stuck in "thinking" far too long
+  4. the barehands board  (port 8794) -- only once you have opened it
+  5. a turn that is stuck in "thinking" far too long
 
 Anything missing or wedged is restarted, and stale duplicates or
 port squatters are cleared first so two things never fight over the
@@ -30,6 +31,7 @@ HOME = os.path.expanduser("~")
 AGENT = os.path.join(HOME, "my-agent")
 BACKTALK = os.path.join(AGENT, "backtalk")
 FACE = os.path.join(AGENT, "ai-visualizer")
+HANDS = os.path.join(AGENT, "barehands")
 BUS = os.path.join(BACKTALK, ".voice_state")
 LOG = os.path.join(AGENT, "supervisor.log")
 BACKTALK_JSON = os.path.join(BACKTALK, "backtalk.json")
@@ -42,7 +44,18 @@ FALLBACK_MODEL = "nvidia/nvidia/nemotron-3-super-120b-a12b"
 
 BRAIN_PORT = 4599
 FACE_PORT = 8790
+HANDS_PORT = 8794
 UV = os.path.join(HOME, ".local", "bin", "uv.exe")
+
+# The hands board is the optional piece, so it is only supervised when it is
+# installed AND enabled. Watching it unconditionally would restart a board
+# the user deliberately closed -- hands is a "hold this open while I work"
+# tool, not a service, so starting it out of nowhere would put a window on
+# screen nobody asked for.
+#
+# Enabled by barehands/state/.enabled, which the launcher writes. A missing
+# barehands/ folder also counts as not-installed, so nothing here is a
+# problem for someone who never took the hands option.
 
 STUCK_AFTER = 240
 POLL = 10.0
@@ -236,16 +249,40 @@ def spawn(cmd: str, cwd: str) -> None:
                      creationflags=CREATE_NO_WINDOW, **DETACH)
 
 
+def owners_of(port: int) -> set[int]:
+    """Every PID listening on `port`. Usually one; more than one is a bug.
+
+    There can genuinely be two, and that is the whole point of asking for
+    all of them rather than the first. Windows' SO_REUSEADDR lets a second
+    process bind a port that is already bound, so a duplicated server does
+    not fail cleanly -- it sits there holding the same port and the kernel
+    hands arriving connections to either one. netstat shows two LISTENING
+    rows on 8790 for exactly that reason.
+
+    Get-NetTCPConnection is not trustworthy for this: it returned each of
+    the two PIDs on different runs for the same port, so "who owns the port"
+    is not even a stable question. netstat -ano reports both, every time.
+    """
+    out = subprocess.run(["netstat", "-ano"], capture_output=True,
+                         text=True, timeout=45, errors="replace")
+    pids = set()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        local, state, pid = parts[1], parts[3].upper(), parts[4]
+        if state != "LISTENING" or not pid.isdigit():
+            continue
+        # Match the port exactly, so 8790 does not also match 87904.
+        if local.rsplit(":", 1)[-1] == str(port):
+            pids.add(int(pid))
+    return pids
+
+
 def owner_of(port: int) -> int:
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue "
-         f"| Select-Object -First 1).OwningProcess"],
-        capture_output=True, text=True, timeout=45)
-    for tok in out.stdout.split():
-        if tok.isdigit():
-            return int(tok)
-    return 0
+    """The first PID listening on `port`, or 0. Use owners_of() to see all."""
+    pids = owners_of(port)
+    return min(pids) if pids else 0
 
 
 def http_ok(port: int, path: str, timeout: float = 6.0) -> bool:
@@ -328,13 +365,16 @@ def ensure_brain() -> None:
 
 def ensure_face() -> None:
     if face_alive():
+        # Only the face here. Reaping every stray server would also reach
+        # the hands board, which this function has no business touching --
+        # and would kill the hands board as collateral of a face repair.
+        _reap_duplicate_face()
         return
     if port_open(FACE_PORT):
         say("face was listening but not answering, restarting it")
     else:
         say(f"face was down, restarting on :{FACE_PORT}")
-    for stray in procs(r"ai-visualizer.*server\.py|server\.py"):
-        kill([stray])
+    _clear_face_strays()
     spawn("py -3 server.py", FACE)
     for _ in range(20):
         time.sleep(0.5)
@@ -342,6 +382,125 @@ def ensure_face() -> None:
             say("face is up")
             return
     say("face did not come back up, will retry next cycle")
+
+
+def _server_pids() -> list[int]:
+    """Every live PID whose command line runs a repo's server.py.
+
+    Only the interpreter itself. The launchers are cmd.exe and py.exe
+    wrappers around the same script, and killing those instead leaves the
+    real server running, so the wrappers are filtered out.
+    """
+    return [p for p in procs(r"server\.py") if _is_python(p)]
+
+
+def _is_python(pid: int) -> bool:
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").Name"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return False
+    return "python" in out.stdout.strip().lower()
+
+
+def _listening_ports(pid: int) -> set[int]:
+    """Every TCP port a process is listening on."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -OwningProcess {pid} -State Listen "
+             f"-ErrorAction SilentlyContinue).LocalPort"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return set()
+    return {int(tok) for tok in out.stdout.split() if tok.isdigit()}
+
+
+# Ports a repo server is allowed to be serving. A server.py holding none of
+# them is a copy that failed to bind and is not serving anyone.
+KNOWN_PORTS = {FACE_PORT, HANDS_PORT}
+
+
+def _orphan_server_pids() -> list[int]:
+    """server.py processes that hold no known port, so they serve nobody.
+
+    Both servers are launched as a bare "server.py" from their own folder,
+    so their command lines are identical and Windows exposes no cheap way to
+    read a running process's working directory. Identifying them by folder
+    is therefore unreliable from here.
+
+    Listening ports are unambiguous, and this is the safe direction: a real
+    server is listening on its own port, so anything matching server.py
+    while listening on none of the known ports failed to bind and is dead
+    weight. This never fires on a healthy server.
+    """
+    return [p for p in _server_pids() if not (_listening_ports(p) & KNOWN_PORTS)]
+
+
+def ensure_hands_no_duplicates() -> None:
+    """Kill a second hands server, once the board is answering.
+
+    The hands board can be bound twice the same way the face can, and this
+    is kept separate from _reap_duplicate_face() so neither can reach the
+    other's port.
+    """
+    if not hands_alive():
+        return
+    for pid in _duplicate_port_pids(HANDS_PORT):
+        say(f"hands port {HANDS_PORT} had a duplicate copy (pid {pid}), killing it")
+        kill([pid])
+
+
+def _duplicate_port_pids(port: int) -> list[int]:
+    """Servers bound to `port` beyond the first one.
+
+    netstat reports both copies when Windows' SO_REUSEADDR let a duplicate
+    bind a busy port. They cannot be told apart by folder, so the older
+    process is kept (it is the one that was there first and is the one
+    clients were talking to) and every other holder is a duplicate.
+
+    Only called when the port is genuinely answering, so at least one holder
+    is the real server.
+    """
+    holders = sorted(p for p in owners_of(port) if _is_python(p))
+    return holders[1:]
+
+
+def _clear_face_strays() -> None:
+    """Kill every server.py before starting a replacement face.
+
+    Only called when the face is genuinely not answering, so anything
+    serving one of the two ports is a squatter and everything else is a
+    leftover.
+    """
+    strays = _server_pids()
+    if strays:
+        kill(strays)
+
+
+def _reap_duplicate_face() -> None:
+    """Kill a second face server bound to the face port.
+
+    Clicking a Desktop shortcut while the face is already up started a
+    second copy. Windows' SO_REUSEADDR lets a second process bind an
+    already-bound port, so instead of failing cleanly the duplicate stayed on
+    8790 as well and netstat showed two LISTENING rows. The kernel then
+    picks which copy answers any given request, so the face flickered
+    between two copies and both held ~35 MB.
+
+    Scoped to the face port on purpose. An earlier version also swept up
+    every server.py that held no port at all, which meant a face repair
+    killed the hands board -- the one process here that is supposed to hold
+    no port while it is still starting up.
+
+    The older holder of the port is kept, so the working face is never the
+    one killed. Only runs when the face is confirmed answering.
+    """
+    for pid in _duplicate_port_pids(FACE_PORT):
+        say(f"face port {FACE_PORT} had a duplicate copy (pid {pid}), killing it")
+        kill([pid])
 
 
 def ensure_voice() -> None:
@@ -353,6 +512,45 @@ def ensure_voice() -> None:
         spawn(f'"{UV}" run python -m backtalk.main', BACKTALK)
     else:
         spawn("uv run python -m backtalk.main", BACKTALK)
+
+
+def hands_enabled() -> bool:
+    """True when the hands board is installed and the user turned it on.
+
+    The marker file is what makes this opt-in: hands is a tool you open when
+    you want it, so the supervisor repairs it once it has been asked for and
+    otherwise leaves it alone. Watching it unconditionally would put a
+    window on screen after the user deliberately closed it.
+    """
+    if not os.path.isdir(HANDS):
+        return False
+    return os.path.exists(os.path.join(HANDS, "state", ".enabled"))
+
+
+def hands_alive() -> bool:
+    return http_ok(HANDS_PORT, "/config")
+
+
+def ensure_hands() -> None:
+    if not hands_enabled():
+        return
+    if hands_alive():
+        ensure_hands_no_duplicates()
+        return
+    if port_open(HANDS_PORT):
+        say("hands was listening but not answering, restarting it")
+    else:
+        say(f"hands was down, restarting on :{HANDS_PORT}")
+    stray = owner_of(HANDS_PORT)
+    if stray:
+        kill([stray])
+    spawn("py -3 server.py", HANDS)
+    for _ in range(20):
+        time.sleep(0.5)
+        if hands_alive():
+            say("hands is up")
+            return
+    say("hands did not come back up, will retry next cycle")
 
 
 def known_models() -> set:
@@ -444,6 +642,7 @@ def once() -> None:
     repair_model()
     ensure_face()
     ensure_voice()
+    ensure_hands()
     recover_stuck()
 
 
@@ -475,6 +674,20 @@ def stop() -> None:
     if face:
         kill([face])
 
+    # Hands too, and the marker cleared, or a restart would immediately bring
+    # back a board the user just asked to close. Leaving the marker would make
+    # --stop only half work: the board would come back on the next poll.
+    if port_open(HANDS_PORT):
+        hands = owner_of(HANDS_PORT)
+        if hands:
+            kill([hands])
+    marker = os.path.join(HANDS, "state", ".enabled")
+    if os.path.exists(marker):
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+
     # The face and the voice are gone now; confirm it, so a failure to stop
     # is visible instead of silently reappearing.
     time.sleep(1.0)
@@ -483,6 +696,8 @@ def stop() -> None:
         still.append("face")
     if procs(r"backtalk\.main"):
         still.append("voice")
+    if port_open(HANDS_PORT):
+        still.append("hands")
     if still:
         say(f"WARNING: {', '.join(still)} did not stop")
     else:

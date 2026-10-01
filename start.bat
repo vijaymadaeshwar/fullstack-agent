@@ -25,9 +25,31 @@ rem   start.bat hands    the voice and the hands board (no face)
 
 cd /d "%~dp0.."
 
+rem Hands is opt-in for the supervisor, so ask it to watch: this marker is
+rem the whole contract. The launcher writes it when the user opens the
+rem board, and --stop clears it, so closing the board means what it says.
+rem Writing it before the launch below also means a crash during startup
+rem still gets repaired instead of left dead.
+if exist "barehands\" (
+  if not "%1"=="voice" (
+    if not exist "barehands\state\" mkdir "barehands\state" >nul 2>&1
+    >"barehands\state\.enabled" echo enabled
+  )
+)
+
+rem Start a server only if it is not already answering. The launchers have
+rem no such check themselves, so without this every click of a Desktop
+rem shortcut started a second copy: the loser cannot bind the port, and on
+rem Windows that can leave it alive, serving nothing and stealing requests
+rem from the real one.
 if exist "ai-visualizer\" if not "%1"=="hands" (
-  echo   face:  starting
-  start "agent face" cmd /c "cd ai-visualizer && run.bat"
+  powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:8790/config; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1"
+  if errorlevel 1 (
+    echo   face:  starting
+    start "agent face" cmd /c "cd ai-visualizer && run.bat"
+  ) else (
+    echo   face:  already running
+  )
 )
 
 rem Both servers are started through their own run.bat, which finds a
@@ -38,8 +60,13 @@ rem `where` and then exits 9009, so the check has to run an interpreter
 rem rather than locate one -- and that belongs in one place per repo, not
 rem duplicated here where a standalone user would never see the fix.
 if exist "barehands\" if not "%1"=="voice" (
-  echo   hands: starting
-  start "agent hands" cmd /c "cd barehands && run.bat"
+  powershell -NoProfile -Command "try { $r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:8794/config; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; exit 1"
+  if errorlevel 1 (
+    echo   hands: starting
+    start "agent hands" cmd /c "cd barehands && run.bat"
+  ) else (
+    echo   hands: already running
+  )
 )
 
 if exist "backtalk\" (
@@ -79,4 +106,8 @@ if exist "backtalk\" (
     echo   The log lives in backtalk\logs\backtalk.log
     pause
   )
+  rem Closing this window means the stack is done, so tell the supervisor to
+  rem stop resurrecting it. Without this, "close the window" restarted the
+  rem voice on the watchdog's next poll -- and hands with it.
+  if exist "barehands\state\.enabled" del /q "barehands\state\.enabled" >nul 2>&1
 )
