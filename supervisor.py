@@ -1,4 +1,4 @@
-"""supervisor.py - keeps the Jarvis stack alive so it just works.
+"""supervisor.py - keeps the Seyon stack alive so it just works.
 
 Checks, on a loop:
   1. the opencode brain   (port 4599)
@@ -451,7 +451,7 @@ def stop() -> None:
     """Stop the whole stack, the watchdog included.
 
     The supervisor used to stop only the voice and the face, which meant
-    "Stop Jarvis.bat" did not stop anything: the supervisor was still
+    "Stop Seyon.bat" did not stop anything: the supervisor was still
     running, so its very next poll saw voice and face missing and started
     them again within ten seconds. The user got a "stopped" message and
     then watched everything come back on its own.
