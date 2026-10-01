@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import msvcrt
 import os
 import socket
 import subprocess
@@ -32,6 +33,7 @@ BUS = os.path.join(BACKTALK, ".voice_state")
 LOG = os.path.join(AGENT, "supervisor.log")
 BACKTALK_JSON = os.path.join(BACKTALK, "backtalk.json")
 BT_LOG = os.path.join(BACKTALK, "logs", "backtalk.log")
+LOCK = os.path.join(AGENT, "supervisor.lock")
 
 # The model proven to answer reliably here. Used only to repair a config
 # whose model has disappeared from the provider.
@@ -147,6 +149,44 @@ def say(msg: str) -> None:
             f.write(line + "\n")
     except OSError:
         pass
+
+
+def claim_singleton() -> bool:
+    """Take exclusive ownership of the lock file, or report that someone
+    else already has it.
+
+    Two supervisors fight: each sees the other's children as healthy, or
+    each kills what the other just started, and you get two brains fighting
+    over port 4599 plus a service that flickers. The lock file is held open
+    for the life of the process and locked non-blocking, which Windows
+    releases automatically if this process dies -- including a hard kill, so
+    there is no stale lock to clean up by hand after a crash.
+    """
+    f = open(LOCK, "a+")
+    # seek BEFORE locking, and this is not cosmetic. msvcrt.locking locks the
+    # byte range starting at the CURRENT position, and "a+" opens with the
+    # pointer at end of file. The holder writes its pid, so the next process
+    # would lock the byte AFTER that pid while the holder holds byte 0 --
+    # different ranges, no conflict, both walk in. Always lock byte 0.
+    f.seek(0)
+    try:
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        f.close()
+        return False
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    # Module level on purpose. As a local this handle is dropped when the
+    # function returns, the file closes, and Windows releases the lock --
+    # so the very first extra supervisor walked straight in. The handle has
+    # to outlive this call or it protects nothing.
+    global _LOCK_HANDLE
+    _LOCK_HANDLE = f
+    return True
+
+
+_LOCK_HANDLE = None
 
 
 def port_open(port: int) -> bool:
@@ -331,11 +371,19 @@ def main() -> int:
         stop()
         return 0
 
-    say("supervisor up, watching brain, face and voice")
-    once()
     if args.once:
+        # A one-shot check must never take the lock: it would fight the
+        # running supervisor over the children it is only inspecting.
+        once()
         say("single check done")
         return 0
+
+    if not claim_singleton():
+        say("another supervisor already holds the lock, exiting quietly")
+        return 0
+
+    say("supervisor up, watching brain, face and voice")
+    once()
     beat = time.time()
     try:
         while True:
