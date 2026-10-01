@@ -11,8 +11,9 @@ port squatters are cleared first so two things never fight over the
 same port or the same signal bus.
 
   py -3 supervisor.py            run the loop in the foreground
-  py -3 supervisor.py --once     check and repair a single time, then exit
-  py -3 supervisor.py --stop     stop the voice and the face
+  py -3 supervisor.py --once     check and repair once, then exit (skipped
+                                 if a supervisor is already watching)
+  py -3 supervisor.py --stop     stop the whole stack, watchdog included
 """
 from __future__ import annotations
 
@@ -256,19 +257,26 @@ def http_ok(port: int, path: str, timeout: float = 6.0) -> bool:
     that stopped answering -- and the supervisor would happily leave it
     that way forever. Ask for real bytes instead.
 
-    ANY HTTP status counts as alive, including 401. A server that answers
-    "Unauthorized" is very much running; it is telling us the caller needs
-    a credential, which is the application's business, not a reason to
-    declare it dead and restart it in a loop. Only a refused connection, a
-    timeout, or garbage means dead.
+    Most HTTP statuses count as alive, including 401 and 403. A server that
+    answers "Unauthorized" is very much running; it is telling us the
+    caller needs a credential, which is the application's business, not a
+    reason to declare it dead and restart it in a loop. Only a refused
+    connection, a timeout, or garbage means dead.
+
+    404 is the exception, and treating it as alive was a real bug: an
+    unrelated program squatting on the port answers 404 to everything,
+    which "any status is alive" accepted as proof of a healthy brain or
+    face. The supervisor then declared the real service unnecessary and
+    left the squatter holding the port forever. A 404 means "no such
+    endpoint here", which is exactly the wrong-server case worth acting on.
     """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
                                     timeout=timeout) as r:
             r.read(64)
             return True
-    except urllib.error.HTTPError:
-        return True          # it spoke HTTP; it is alive
+    except urllib.error.HTTPError as e:
+        return e.code != 404    # it spoke HTTP, and it knows this path
     except Exception:
         return False
 
@@ -283,9 +291,12 @@ def brain_alive() -> bool:
     # is, by default, in this environment), which tells us nothing about
     # whether the brain works. /config/providers is the endpoint backtalk
     # itself depends on, so if it answers, the brain is genuinely usable.
-    return (http_ok(BRAIN_PORT, "/config/providers")
-            or http_ok(BRAIN_PORT, "/health")
-            or http_ok(BRAIN_PORT, "/", 4.0))
+    #
+    # Only /config/providers is a usable signal here. Falling back to "/"
+    # would undo the 404 fix above: the embedded UI is disabled in this
+    # environment, so the brain answers 404 on "/", and treating that as
+    # "alive" would let a wedged brain pass as healthy.
+    return http_ok(BRAIN_PORT, "/config/providers")
 
 
 def ensure_brain() -> None:
@@ -437,11 +448,45 @@ def once() -> None:
 
 
 def stop() -> None:
+    """Stop the whole stack, the watchdog included.
+
+    The supervisor used to stop only the voice and the face, which meant
+    "Stop Jarvis.bat" did not stop anything: the supervisor was still
+    running, so its very next poll saw voice and face missing and started
+    them again within ten seconds. The user got a "stopped" message and
+    then watched everything come back on its own.
+
+    So the watchdog has to go first, or nothing after it will stick. Order
+    matters -- killing the children before the supervisor just invites a
+    restart on the way out. The brain is deliberately left running, because
+    the other agents share it.
+    """
+    # Every supervisor, including any that is not this process. This one is
+    # a --stop run, so it must not match its own pattern; the (?!...) guard
+    # is belt-and-braces for a repo path containing "supervisor".
+    watchers = [p for p in procs(r"supervisor\.py(?!.*--stop)") if p != os.getpid()]
+    if watchers:
+        say(f"stopping the supervisor ({len(watchers)} running)")
+        kill(watchers)
+
     say("stopping voice and face")
     kill(procs(r"backtalk\.main"))
     face = owner_of(FACE_PORT)
     if face:
         kill([face])
+
+    # The face and the voice are gone now; confirm it, so a failure to stop
+    # is visible instead of silently reappearing.
+    time.sleep(1.0)
+    still = []
+    if port_open(FACE_PORT):
+        still.append("face")
+    if procs(r"backtalk\.main"):
+        still.append("voice")
+    if still:
+        say(f"WARNING: {', '.join(still)} did not stop")
+    else:
+        say("stack stopped (brain left running for the other agents)")
 
 
 def main() -> int:
@@ -455,8 +500,21 @@ def main() -> int:
         return 0
 
     if args.once:
-        # A one-shot check must never take the lock: it would fight the
-        # running supervisor over the children it is only inspecting.
+        # Take the lock here too. The original reason to skip it was that a
+        # one-shot check "only inspects", but it does not: once() calls the
+        # same ensure_* functions the loop does, and repairs whatever it
+        # finds. So an unlocked --once running alongside the real
+        # supervisor could kill a face the supervisor had just started, and
+        # the two would trade restarts forever.
+        #
+        # Taking the lock and bailing out when it is held gives the safe
+        # behaviour instead: if a supervisor is already watching, there is
+        # nothing for --once to do, and it exits instead of interfering.
+        # claim_singleton() keeps the handle at module scope, so the lock
+        # is released when this process exits.
+        if not claim_singleton():
+            say("another supervisor is already watching, nothing for --once to do")
+            return 0
         once()
         say("single check done")
         return 0
