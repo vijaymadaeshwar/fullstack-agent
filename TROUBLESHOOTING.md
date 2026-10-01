@@ -37,6 +37,16 @@ The wiring is one config line, plus a restart. Check both:
 
 While the agent speaks, the backtalk folder should contain fresh `.voice_state` and `.voice_waveform` files. If they are not appearing, the problem is on the voice side; work backtalk's own guide.
 
+## Typing works but key shortcuts do nothing
+
+`WARNING: Windows rejected synthetic keystrokes (0 of N events accepted)` means the process cannot inject input at all. It is not the target app's fault — Windows refuses synthetic keys from a service session, a session-0 launch, or a detached process, and returns "0 accepted" rather than an error.
+
+Check where the thing runs. `session`: run `query session` and compare; session 0 is the system session and cannot touch your windows. Anything started by a service, a scheduled task set to "run whether or not the user is logged on", or `psexec` lands there.
+
+The same applies to an agent launched from a terminal that is not attached to your desktop. Start it from a normal console you can see and type into, not from a background shell.
+
+Text typed with the `type` command is more forgiving: it falls back to window messages, which the window manager delivers regardless of desktop, so typing often works when shortcuts do not. If both stop working, it is this.
+
 ## Some languages come out in an English accent, or not at all
 
 Kokoro ships 54 voices across 9 languages (both English accents, Spanish, French, Hindi, Italian, Japanese, Portuguese, Mandarin). Anything outside that set is handled by **espeak-ng**, which covers around 100 languages including Tamil, Korean, Arabic, Russian, Thai and German. If espeak-ng is missing, those languages silently fall back to being read in English:
