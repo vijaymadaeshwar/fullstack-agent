@@ -1,0 +1,274 @@
+"""supervisor.py - keeps the Jarvis stack alive so it just works.
+
+Checks, on a loop:
+  1. the opencode brain   (port 4599)
+  2. the ai-visualizer face (port 8790)
+  3. the backtalk voice
+  4. a turn that is stuck in "thinking" far too long
+
+Anything missing or wedged is restarted, and stale duplicates or
+port squatters are cleared first so two things never fight over the
+same port or the same signal bus.
+
+  py -3 supervisor.py            run the loop in the foreground
+  py -3 supervisor.py --once     check and repair a single time, then exit
+  py -3 supervisor.py --stop     stop the voice and the face
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+AGENT = os.path.join(HOME, "my-agent")
+BACKTALK = os.path.join(AGENT, "backtalk")
+FACE = os.path.join(AGENT, "ai-visualizer")
+BUS = os.path.join(BACKTALK, ".voice_state")
+LOG = os.path.join(AGENT, "supervisor.log")
+BACKTALK_JSON = os.path.join(BACKTALK, "backtalk.json")
+BT_LOG = os.path.join(BACKTALK, "logs", "backtalk.log")
+
+# The model proven to answer reliably here. Used only to repair a config
+# whose model has disappeared from the provider.
+FALLBACK_MODEL = "nvidia/nvidia/nemotron-3-super-120b-a12b"
+
+BRAIN_PORT = 4599
+FACE_PORT = 8790
+UV = os.path.join(HOME, ".local", "bin", "uv.exe")
+
+STUCK_AFTER = 240
+POLL = 10.0
+
+DETACH = {
+    "stdin": subprocess.DEVNULL,
+    "stdout": subprocess.DEVNULL,
+    "stderr": subprocess.DEVNULL,
+    "close_fds": True,
+}
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def say(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def procs(pattern: str) -> list[int]:
+    """PIDs whose command line matches a regex, via one WMIC-free call."""
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -match '{pattern}' "
+         f"-and $_.Name -notmatch 'powershell' }}).ProcessId"],
+        capture_output=True, text=True, timeout=45)
+    pids = []
+    for tok in out.stdout.split():
+        if tok.isdigit():
+            pids.append(int(tok))
+    return pids
+
+
+def kill(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=30)
+        except Exception:
+            pass
+    if pids:
+        time.sleep(1.5)
+
+
+def spawn(cmd: str, cwd: str) -> None:
+    subprocess.Popen(cmd, cwd=cwd, shell=True, creationflags=CREATE_NO_WINDOW, **DETACH)
+
+
+def owner_of(port: int) -> int:
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue "
+         f"| Select-Object -First 1).OwningProcess"],
+        capture_output=True, text=True, timeout=45)
+    for tok in out.stdout.split():
+        if tok.isdigit():
+            return int(tok)
+    return 0
+
+
+def ensure_brain() -> None:
+    if port_open(BRAIN_PORT):
+        return
+    say(f"brain was down, restarting on :{BRAIN_PORT}")
+    exe = os.path.join(HOME, "AppData", "Roaming", "npm", "node_modules",
+                       "opencode-ai", "bin", "opencode.exe")
+    if os.path.exists(exe):
+        spawn(f'"{exe}" serve --port {BRAIN_PORT} --hostname 127.0.0.1', AGENT)
+    for _ in range(30):
+        time.sleep(1)
+        if port_open(BRAIN_PORT):
+            say("brain is up")
+            return
+    say("brain did not come back up, will retry next cycle")
+
+
+def ensure_face() -> None:
+    if port_open(FACE_PORT):
+        return
+    say(f"face was down, restarting on :{FACE_PORT}")
+    for stray in procs(r"ai-visualizer.*server\.py|server\.py"):
+        kill([stray])
+    spawn("py -3 server.py", FACE)
+    for _ in range(20):
+        time.sleep(0.5)
+        if port_open(FACE_PORT):
+            say("face is up")
+            return
+    say("face did not come back up, will retry next cycle")
+
+
+def ensure_voice() -> None:
+    running = procs(r"backtalk\.main")
+    if running:
+        return
+    say("voice was not running, starting it")
+    if os.path.exists(UV):
+        spawn(f'"{UV}" run python -m backtalk.main', BACKTALK)
+    else:
+        spawn("uv run python -m backtalk.main", BACKTALK)
+
+
+def known_models() -> set:
+    """Full 'provider/model_id' refs the brain can actually serve right now."""
+    import urllib.request
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{BRAIN_PORT}/config/providers", timeout=20) as r:
+        data = json.load(r)
+    out = set()
+    for p in data.get("providers", data if isinstance(data, list) else []):
+        models = p.get("models") or {}
+        ids = list(models) if isinstance(models, dict) else [
+            m.get("id") or m.get("name") for m in models]
+        for mid in ids:
+            if mid:
+                out.add(f"{p.get('id')}/{mid}")
+    return out
+
+
+def repair_model() -> None:
+    """A model that has vanished from the provider is the one failure the
+    user cannot work around by talking. Rewrite the config to the known-good
+    model and let the voice pick it up on its next start."""
+    try:
+        with open(BACKTALK_JSON, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return
+    model = cfg.get("model")
+    if not model:
+        return
+    if model in known_models():
+        return
+    say(f"model {model!r} is no longer offered, switching to {FALLBACK_MODEL}")
+    cfg["model"] = FALLBACK_MODEL
+    if cfg.get("deep_model") and cfg["deep_model"] not in known_models():
+        cfg["deep_model"] = FALLBACK_MODEL
+    try:
+        tmp = BACKTALK_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, BACKTALK_JSON)
+    except OSError as e:
+        say(f"could not write the repaired config: {e}")
+        return
+    if procs(r"backtalk\.main"):
+        kill(procs(r"backtalk\.main"))
+
+
+def bus_state() -> tuple[str, float]:
+    try:
+        with open(BUS, encoding="utf-8") as f:
+            return f.read().strip(), os.path.getmtime(BUS)
+    except OSError:
+        return "", 0.0
+
+
+def recover_stuck() -> None:
+    state, mtime = bus_state()
+    if not mtime:
+        return
+    age = time.time() - mtime
+    if state in ("thinking", "speaking") and age > STUCK_AFTER:
+        say(f"turn looked stuck in {state!r} for {age:.0f}s, restarting the voice")
+        kill(procs(r"backtalk\.main"))
+        time.sleep(2)
+        ensure_voice()
+
+
+def once() -> None:
+    ensure_brain()
+    repair_model()
+    ensure_face()
+    ensure_voice()
+    recover_stuck()
+
+
+def stop() -> None:
+    say("stopping voice and face")
+    kill(procs(r"backtalk\.main"))
+    face = owner_of(FACE_PORT)
+    if face:
+        kill([face])
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--stop", action="store_true")
+    args = ap.parse_args()
+
+    if args.stop:
+        stop()
+        return 0
+
+    say("supervisor up, watching brain, face and voice")
+    once()
+    if args.once:
+        say("single check done")
+        return 0
+    beat = time.time()
+    try:
+        while True:
+            time.sleep(POLL)
+            try:
+                once()
+            except Exception as e:
+                say(f"check failed, continuing: {type(e).__name__}: {e}")
+            # A heartbeat, because silence here is indistinguishable from a
+            # dead process: silence used to mean "nothing needed fixing" and
+            # also "the watcher had been killed".
+            if time.time() - beat >= 600:
+                say("still watching, all quiet")
+                beat = time.time()
+    except KeyboardInterrupt:
+        say("supervisor stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

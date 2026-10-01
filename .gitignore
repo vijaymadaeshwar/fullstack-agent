@@ -1,3 +1,9 @@
-.DS_Store
-__pycache__/
-*.pyc
+# Download logs: the model downloads report progress here and are
+# resumable, so the log only matters while a download is in flight.
+lang.log
+medium.log
+
+# Model weights and caches never belong in a repo.
+*.part
+*.bin
+*.mp3
