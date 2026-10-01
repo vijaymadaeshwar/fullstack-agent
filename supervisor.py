@@ -53,11 +53,96 @@ DETACH = {
 
 CREATE_NO_WINDOW = 0x08000000
 
+# Log rotation. The voice line appends every turn and this file appends a
+# heartbeat, so on a machine that starts at login neither ever stops: both
+# are unbounded otherwise. Rotation is by SIZE, not age, because the thing
+# that grows is exactly the thing that matters -- a burst of errors should
+# not be able to push out months of quiet history, and a quiet month should
+# not cost disk.
+#
+# KEEP=3 means the live file plus three archives, so the previous failure
+# before a crash is still on disk to read. Rotating keeps the ARCHIVE with
+# the lower number the NEWER one: .1 is the most recent archive. Renaming
+# downwards rather than copying avoids a window where the log does not
+# exist at all, which is what a delete-then-rename would leave behind.
+LOG_MAX_BYTES = 2 * 1024 * 1024      # 2 MB before rotation
+LOG_KEEP = 3
+
+
+def rotate(path: str, max_bytes: int | None = None, keep: int | None = None) -> None:
+    """Keep `path` under max_bytes, shifting archives .1..keep.
+
+    The limits are read at CALL time rather than bound as default arguments,
+    which snapshot their values when this function is defined: changing
+    LOG_MAX_BYTES afterwards would silently do nothing, and a caller testing
+    a small threshold would instead be testing the production one.
+    """
+    if max_bytes is None:
+        max_bytes = LOG_MAX_BYTES
+    if keep is None:
+        keep = LOG_KEEP
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= max_bytes:
+            return
+        _shift_archives(path, keep)
+        try:
+            os.replace(path, f"{path}.1")
+            return
+        except PermissionError:
+            # WINDOWS SPECIFIC, and it is the normal case here, not an edge
+            # case: the voice process holds backtalk.log open for the whole
+            # session, and Windows refuses to rename a file another process
+            # has open. Swallowing this would mean the log never rotates at
+            # all -- silently, forever, which is exactly what this was
+            # written to prevent.
+            #
+            # So fall back to archiving the CONTENT and truncating in place.
+            # Truncating keeps the same file object the writer holds, so the
+            # voice keeps appending to the same handle with no interruption,
+            # and the previous contents are already saved as the archive.
+            _archive_in_place(path, keep)
+    except OSError:
+        # Rotation failing must never stop the watchdog: the log growing is
+        # a far smaller problem than the face not coming back.
+        pass
+
+
+def _shift_archives(path: str, keep: int) -> None:
+    """Roll .1 -> .2 -> ... -> .keep, dropping the oldest."""
+    oldest = f"{path}.{keep}"
+    if os.path.exists(oldest):
+        os.remove(oldest)
+    for i in range(keep - 1, 0, -1):
+        src = f"{path}.{i}"
+        if os.path.exists(src):
+            os.replace(src, f"{path}.{i + 1}")
+
+
+def _archive_in_place(path: str, keep: int) -> None:
+    """Save the current contents as .1, then empty the original file.
+
+    Used when the file cannot be renamed because a writer holds it open.
+    """
+    import shutil
+    tmp = f"{path}.1.tmp"
+    try:
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, f"{path}.1")
+        with open(path, "w", encoding="utf-8"):
+            pass
+    except OSError:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
 
 def say(msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     print(line, flush=True)
     try:
+        rotate(LOG)
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
@@ -262,6 +347,13 @@ def main() -> int:
             # A heartbeat, because silence here is indistinguishable from a
             # dead process: silence used to mean "nothing needed fixing" and
             # also "the watcher had been killed".
+            #
+            # The voice line's log is the one that grows fast, since it
+            # records every turn and this process does not own it. Rotating
+            # it from here keeps it honest even though backtalk is the
+            # writer, and it avoids adding rotation code to backtalk itself,
+            # which is a fork that should stay close to upstream.
+            rotate(BT_LOG)
             if time.time() - beat >= 600:
                 say("still watching, all quiet")
                 beat = time.time()
