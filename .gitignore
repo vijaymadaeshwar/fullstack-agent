@@ -7,3 +7,4 @@ medium.log
 *.part
 *.bin
 *.mp3
+__pycache__/
