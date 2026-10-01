@@ -257,6 +257,41 @@ def _uia_document(hwnd: int):
         return None, None
 
 
+def _uia_read(hwnd: int) -> str:
+    """The window's current text, or "" when it cannot be read."""
+    pattern, _ = _uia_document(hwnd)
+    if pattern is None:
+        return ""
+    try:
+        return str(pattern.CurrentValue or "")
+    except Exception:
+        try:
+            return str(pattern.get_CurrentValue() or "")
+        except Exception:
+            return ""
+
+
+def _uia_contains(hwnd: int, text: str) -> bool:
+    """Whether the window actually shows `text` now.
+
+    This is the check that makes a keystroke-based attempt verifiable. It
+    cannot be perfect -- a window with no readable document always answers
+    False, so callers must treat it as "no evidence it worked" rather than
+    proof it failed, and fall through to a path that does not need it.
+    """
+    if not text:
+        return True
+    probe = text.strip()
+    if not probe:
+        return True
+    current = _uia_read(hwnd)
+    if not current:
+        return False
+    # Compare on the tail: a paste into a window that already had text
+    # appends, so the new text is at the end rather than the start.
+    return probe in current or probe in current[-len(probe) * 2:]
+
+
 def _uia_type(hwnd: int, text: str) -> bool:
     """Put text into a window over UIA. Replaces the window's contents
     rather than typing at a cursor, which is what a voice command means."""
@@ -380,13 +415,24 @@ def type_text(text: str, paste_threshold: int = 24,
             return True
 
     if len(text) > paste_threshold:
+        # A paste is keystrokes too, so it is subject to exactly the same
+        # problem: from the wrong desktop ctrl+v goes nowhere while this
+        # function reports success. This branch used to `return True`
+        # unconditionally, which meant any sentence over 24 characters
+        # silently did nothing at all. So the result is now READ BACK and,
+        # if the text is not there, the UIA path runs -- which is what makes
+        # the length threshold irrelevant instead of a failure mode.
         saved = clip_get()
         clip_set(text)
         press("ctrl+v")
-        time.sleep(0.15)
+        time.sleep(0.2)
         if saved:
             clip_set(saved)
-        return True
+        if not hwnd or _uia_contains(hwnd, text):
+            return True
+        if _uia_type(hwnd, text):
+            return True
+        return _post_text(hwnd, text)
     events: list[INPUT] = []
     for ch in text:
         events.append(char_event(ch, False))
