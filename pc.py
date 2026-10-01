@@ -152,12 +152,36 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
 
 
-def send_input(events: list[INPUT]) -> None:
+def send_input(events: list[INPUT]) -> bool:
+    """Deliver synthetic keystrokes. False means Windows rejected them.
+
+    SendInput reports how many events it accepted, and it silently accepts
+    NONE when the process has no right to inject -- a service session, a
+    session 0 launch, or a desktop the input desktop does not belong to. The
+    old code discarded the return value, so every keystroke could be thrown
+    away with no indication at all, and a caller had no way to tell "typed
+    fine" from "did nothing". That is what made a broken Ctrl+C look like a
+    Notepad problem for a long time. Checked here and warned once.
+    """
     n = len(events)
     if n == 0:
-        return
+        return True
     arr = (INPUT * n)(*events)
-    user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(INPUT))
+    sent = user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(INPUT))
+    if sent != n:
+        global _WARNED_INJECTION
+        if not _WARNED_INJECTION:
+            _WARNED_INJECTION = True
+            print("WARNING: Windows rejected synthetic keystrokes "
+                  f"({sent} of {n} events accepted). This process cannot "
+                  "inject input -- it is probably running in a service or "
+                  "detached session. Typing and key commands will do "
+                  "nothing until it runs in your interactive session.",
+                  file=sys.stderr)
+    return sent == n
+
+
+_WARNED_INJECTION = False
 
 
 def key_down(vk: int) -> INPUT:
@@ -306,11 +330,35 @@ def _uia_type(hwnd: int, text: str) -> bool:
         return False
 
 
+def _desktop_name(handle: int) -> str:
+    """The name of a desktop handle (UOI_NAME = 2).
+
+    Needed because comparing desktop HANDLES is not enough: the same desktop
+    can be reached through different handles, and the input desktop is a
+    separate open each time.
+    """
+    u32 = ctypes.windll.user32
+    buf = ctypes.create_unicode_buffer(256)
+    need = ctypes.c_uint(0)
+    if not u32.GetUserObjectInformationW(
+            handle, 2, buf, ctypes.sizeof(buf), ctypes.byref(need)):
+        return ""
+    return buf.value
+
+
 def input_desktop_is_current() -> bool:
     """Keystroke injection only works from the desktop that owns physical
     input. When the agent runs on a different desktop every SendInput
     quietly does nothing, which is why typing appeared to succeed and yet
-    never reached the window. Detect it and take a different route."""
+    never reached the window. Detect it and take a different route.
+
+    The two desktops are compared BY NAME. The previous version called
+    GetUserObjectInformation with a zero-length buffer and tested the return
+    for >= 0, but that call reports the buffer size it needs -- a
+    non-negative number for any valid handle -- so it answered "yes, fine"
+    on every desktop including the wrong one, and the fallback route it was
+    written to trigger never ran.
+    """
     k32 = ctypes.windll.kernel32
     u32 = ctypes.windll.user32
     try:
@@ -319,7 +367,7 @@ def input_desktop_is_current() -> bool:
         if not inp:
             return True
         try:
-            return u32.GetUserObjectInformation(cur, 2, None, 0, None) >= 0
+            return _desktop_name(cur) == _desktop_name(inp)
         finally:
             u32.CloseDesktop(inp)
     except Exception:
@@ -375,7 +423,13 @@ def _post_text(hwnd: int, text: str) -> bool:
         return True
     WM_SETTEXT = 0x000C
     buf = ctypes.create_unicode_buffer(text)
-    user32.SendMessageW(target, WM_SETTEXT, 0, ctypes.cast(buf, wt.LPARAM))
+    # The parameter is declared wt.LPARAM, which ctypes defines as c_longlong
+    # -- an integer. Passing a pointer object (or wt.LPWSTR) raises
+    # ArgumentError, and the old code did exactly that with wt.LPARAM, so
+    # every WM_SETTEXT here raised TypeError instead of setting any text:
+    # the last-resort path was dead code. Pass the address as an integer.
+    user32.SendMessageW(target, WM_SETTEXT, 0,
+                        ctypes.cast(buf, ctypes.c_void_p).value)
     time.sleep(0.2)
     if saved:
         clip_set(saved)
