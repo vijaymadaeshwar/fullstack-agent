@@ -415,7 +415,9 @@ def _post_text(hwnd: int, text: str) -> bool:
     user32.SendMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
     user32.SendMessageW.restype = wt.LPARAM
     before = _read_window_text(target)
-    ok = bool(user32.PostMessageW(target, WM_PASTE, 0, 0))
+    # Whether PostMessage succeeded is not the interesting signal; whether
+    # the text actually changed is. Trust the readback, not the return code.
+    user32.PostMessageW(target, WM_PASTE, 0, 0)
     time.sleep(0.35)
     if _read_window_text(target) != before:
         if saved:

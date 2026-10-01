@@ -22,7 +22,6 @@ import msvcrt
 import os
 import socket
 import subprocess
-import sys
 import time
 import urllib.request
 
