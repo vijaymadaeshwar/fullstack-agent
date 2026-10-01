@@ -279,9 +279,14 @@ def face_alive() -> bool:
 
 
 def brain_alive() -> bool:
-    # Any HTTP answer means the server is up. It is not critical whether
-    # /health exists, so fall back to the root path.
-    return http_ok(BRAIN_PORT, "/health") or http_ok(BRAIN_PORT, "/", 4.0)
+    # Prefer the API endpoint the brain actually serves. The root path and
+    # /health can both answer 403 when the embedded web UI is disabled (it
+    # is, by default, in this environment), which tells us nothing about
+    # whether the brain works. /config/providers is the endpoint backtalk
+    # itself depends on, so if it answers, the brain is genuinely usable.
+    return (http_ok(BRAIN_PORT, "/config/providers")
+            or http_ok(BRAIN_PORT, "/health")
+            or http_ok(BRAIN_PORT, "/", 4.0))
 
 
 def ensure_brain() -> None:
