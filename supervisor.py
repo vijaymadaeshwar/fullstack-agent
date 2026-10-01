@@ -384,17 +384,13 @@ def ensure_face() -> None:
     say("face did not come back up, will retry next cycle")
 
 
-def _server_pids() -> list[int]:
-    """Every live PID whose command line runs a repo's server.py.
-
-    Only the interpreter itself. The launchers are cmd.exe and py.exe
-    wrappers around the same script, and killing those instead leaves the
-    real server running, so the wrappers are filtered out.
-    """
-    return [p for p in procs(r"server\.py") if _is_python(p)]
-
-
 def _is_python(pid: int) -> bool:
+    """True for a real interpreter, not a cmd.exe or py.exe launcher.
+
+    The launchers wrap the same server script, so a port can be matched to
+    the interpreter that actually serves it. Without this, killing a
+    launcher PID leaves the real server running behind it.
+    """
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
@@ -405,38 +401,7 @@ def _is_python(pid: int) -> bool:
     return "python" in out.stdout.strip().lower()
 
 
-def _listening_ports(pid: int) -> set[int]:
-    """Every TCP port a process is listening on."""
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"(Get-NetTCPConnection -OwningProcess {pid} -State Listen "
-             f"-ErrorAction SilentlyContinue).LocalPort"],
-            capture_output=True, text=True, timeout=30)
-    except Exception:
-        return set()
-    return {int(tok) for tok in out.stdout.split() if tok.isdigit()}
 
-
-# Ports a repo server is allowed to be serving. A server.py holding none of
-# them is a copy that failed to bind and is not serving anyone.
-KNOWN_PORTS = {FACE_PORT, HANDS_PORT}
-
-
-def _orphan_server_pids() -> list[int]:
-    """server.py processes that hold no known port, so they serve nobody.
-
-    Both servers are launched as a bare "server.py" from their own folder,
-    so their command lines are identical and Windows exposes no cheap way to
-    read a running process's working directory. Identifying them by folder
-    is therefore unreliable from here.
-
-    Listening ports are unambiguous, and this is the safe direction: a real
-    server is listening on its own port, so anything matching server.py
-    while listening on none of the known ports failed to bind and is dead
-    weight. This never fires on a healthy server.
-    """
-    return [p for p in _server_pids() if not (_listening_ports(p) & KNOWN_PORTS)]
 
 
 def ensure_hands_no_duplicates() -> None:
@@ -469,15 +434,17 @@ def _duplicate_port_pids(port: int) -> list[int]:
 
 
 def _clear_face_strays() -> None:
-    """Kill every server.py before starting a replacement face.
+    """Clear the face port before starting a replacement face.
 
-    Only called when the face is genuinely not answering, so anything
-    serving one of the two ports is a squatter and everything else is a
-    leftover.
+    Scoped to the holders of the face port. Killing every server.py instead
+    would take down the hands board, which is a different service on a
+    different port and is none of the face's business. This runs only when
+    the face is not answering, so nothing healthy is serving 8790 and every
+    holder is a squatter to clear.
     """
-    strays = _server_pids()
-    if strays:
-        kill(strays)
+    squatters = [p for p in owners_of(FACE_PORT) if _is_python(p)]
+    if squatters:
+        kill(squatters)
 
 
 def _reap_duplicate_face() -> None:
