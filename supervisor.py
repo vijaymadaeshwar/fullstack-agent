@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 HOME = os.path.expanduser("~")
 AGENT = os.path.join(HOME, "my-agent")
@@ -236,32 +237,73 @@ def owner_of(port: int) -> int:
     return 0
 
 
+def http_ok(port: int, path: str, timeout: float = 6.0) -> bool:
+    """True only if the server actually answers HTTP on that path.
+
+    A listening socket is not proof of life. A wedged process keeps its
+    port bound and every connect() still succeeds, so a port check alone
+    would report "healthy" for a face that stopped rendering or a brain
+    that stopped answering -- and the supervisor would happily leave it
+    that way forever. Ask for real bytes instead.
+    """
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
+                                    timeout=timeout) as r:
+            return r.status == 200 and bool(r.read(64))
+    except Exception:
+        return False
+
+
+def face_alive() -> bool:
+    return http_ok(FACE_PORT, "/state")
+
+
+def brain_alive() -> bool:
+    # Any HTTP answer means the server is up. It is not critical whether
+    # /health exists, so fall back to the root path.
+    return http_ok(BRAIN_PORT, "/health") or http_ok(BRAIN_PORT, "/", 4.0)
+
+
 def ensure_brain() -> None:
-    if port_open(BRAIN_PORT):
+    if brain_alive():
         return
-    say(f"brain was down, restarting on :{BRAIN_PORT}")
+    # Down, or listening but not answering. Take the port off the table
+    # first, otherwise a wedged instance blocks the replacement.
+    if port_open(BRAIN_PORT):
+        say("brain was listening but not answering, restarting it")
+        for stray in procs(r"opencode.*serve"):
+            kill([stray])
+        for _ in range(10):
+            time.sleep(0.5)
+            if not port_open(BRAIN_PORT):
+                break
+    else:
+        say(f"brain was down, restarting on :{BRAIN_PORT}")
     exe = os.path.join(HOME, "AppData", "Roaming", "npm", "node_modules",
                        "opencode-ai", "bin", "opencode.exe")
     if os.path.exists(exe):
         spawn(f'"{exe}" serve --port {BRAIN_PORT} --hostname 127.0.0.1', AGENT)
     for _ in range(30):
         time.sleep(1)
-        if port_open(BRAIN_PORT):
+        if brain_alive():
             say("brain is up")
             return
     say("brain did not come back up, will retry next cycle")
 
 
 def ensure_face() -> None:
-    if port_open(FACE_PORT):
+    if face_alive():
         return
-    say(f"face was down, restarting on :{FACE_PORT}")
+    if port_open(FACE_PORT):
+        say("face was listening but not answering, restarting it")
+    else:
+        say(f"face was down, restarting on :{FACE_PORT}")
     for stray in procs(r"ai-visualizer.*server\.py|server\.py"):
         kill([stray])
     spawn("py -3 server.py", FACE)
     for _ in range(20):
         time.sleep(0.5)
-        if port_open(FACE_PORT):
+        if face_alive():
             say("face is up")
             return
     say("face did not come back up, will retry next cycle")
