@@ -11,6 +11,10 @@ echo === backtalk/tests/test_journal.py ===
 uv run python tests\test_journal.py
 if errorlevel 1 exit /b %errorlevel%
 echo.
+echo === backtalk/tests/test_wake.py ===
+uv run python tests\test_wake.py
+if errorlevel 1 exit /b %errorlevel%
+echo.
 echo === backtalk/tests/test_stt_langs.py (heavy) ===
 uv run python tests\test_stt_langs.py
 if errorlevel 1 exit /b %errorlevel%

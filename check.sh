@@ -10,6 +10,9 @@ echo ""
 echo "=== backtalk/tests/test_journal.py ==="
 uv run python tests/test_journal.py
 echo ""
+echo "=== backtalk/tests/test_wake.py ==="
+uv run python tests/test_wake.py
+echo ""
 echo "=== backtalk/tests/test_stt_langs.py (heavy) ==="
 uv run python tests/test_stt_langs.py
 echo ""
