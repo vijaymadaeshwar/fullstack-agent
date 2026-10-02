@@ -39,6 +39,12 @@ MARKER="$HOME_DIR/barehands/state/.enabled"
 cleanup() {
   trap - EXIT INT TERM
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+  # Clearing the marker belongs to shutdown, not to the voice: start.sh hands
+  # can be ended without a voice ever running, and a marker left behind there
+  # told the supervisor the board was still wanted, so it kept resurrecting a
+  # board the user had just closed. A hard kill skips this trap on purpose --
+  # that is the crash the supervisor is meant to notice and repair.
+  rm -f "$MARKER"
   echo
   echo "agent stopped."
 }
@@ -90,10 +96,6 @@ fi
 if [ -d "$HOME_DIR/backtalk" ]; then
   echo "  voice: starting (hold your talk key and speak; Ctrl-C here stops everything)"
   cd "$HOME_DIR/backtalk" && ./run.sh
-  # The voice owns this terminal, so it is the thing that decides when the
-  # session is over. Clear the marker here: the board is not wanted once the
-  # conversation is finished.
-  rm -f "$MARKER"
 else
   echo
   echo "No voice installed; servers are up. Ctrl-C stops everything."
