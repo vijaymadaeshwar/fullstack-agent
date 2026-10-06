@@ -19,6 +19,10 @@ echo === backtalk/tests/test_lang_detect.py ===
 uv run python tests\test_lang_detect.py
 if errorlevel 1 exit /b %errorlevel%
 echo.
+echo === backtalk/tests/test_turn_errors.py ===
+uv run python tests\test_turn_errors.py
+if errorlevel 1 exit /b %errorlevel%
+echo.
 echo === backtalk/tests/test_encoding.py ===
 uv run python tests\test_encoding.py
 if errorlevel 1 exit /b %errorlevel%

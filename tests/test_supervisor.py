@@ -530,5 +530,76 @@ class TestRotate(unittest.TestCase):
                              "the live log must be emptied in place")
 
 
+class TestWatchdogSurvivesItsOwnFailures(unittest.TestCase):
+    """The watchdog's job is to outlive everything it supervises.
+
+    Found by reading supervisor.log rather than by running anything: four
+    restarts in a single day with not one error line between them. The
+    first check ran outside the handler, and stderr went to a console
+    `start ""` never redirected, so a dead provider during startup killed
+    the whole thing silently -- hours with nothing on watch and nothing
+    recorded to explain it.
+    """
+
+    @staticmethod
+    def messages(say_mock):
+        return " ".join(c.args[0] for c in say_mock.call_args_list)
+
+    def test_a_failing_check_does_not_escape(self):
+        with mock.patch.object(sup, "once",
+                               side_effect=RuntimeError("provider down")), \
+             mock.patch.object(sup, "rotate"), \
+             mock.patch.object(sup, "say") as say:
+            sup._cycle(sup.time.time())          # must not raise
+        msg = self.messages(say)
+        self.assertIn("check failed", msg)
+        self.assertIn("provider down", msg)
+
+    def test_a_failing_rotate_does_not_escape(self):
+        with mock.patch.object(sup, "once"), \
+             mock.patch.object(sup, "rotate",
+                               side_effect=OSError("log is locked")), \
+             mock.patch.object(sup, "say") as say:
+            sup._cycle(sup.time.time())
+        self.assertIn("rotate failed", self.messages(say))
+
+    def test_a_broken_check_still_lets_the_heartbeat_through(self):
+        """A check that fails forever must not silence the heartbeat:
+        silence is how a dead watcher and a working one look alike."""
+        old = sup.time.time() - 700
+        with mock.patch.object(sup, "once", side_effect=RuntimeError("x")), \
+             mock.patch.object(sup, "rotate"), \
+             mock.patch.object(sup, "say") as say:
+            beat = sup._cycle(old)
+        self.assertIn("still watching", self.messages(say))
+        self.assertGreater(beat, old, "the heartbeat clock must move")
+
+    def test_a_healthy_cycle_is_quiet(self):
+        with mock.patch.object(sup, "once") as once, \
+             mock.patch.object(sup, "rotate") as rotate, \
+             mock.patch.object(sup, "say") as say:
+            beat = sup._cycle(sup.time.time())
+        once.assert_called_once()
+        rotate.assert_called_once()
+        self.assertEqual(say.call_count, 0, "no news on a healthy cycle")
+        self.assertIsInstance(beat, float)
+
+    def test_a_crash_is_written_to_the_log_before_it_exits(self):
+        """The outer handler, for anything the guards above cannot catch.
+        Before it, a bug here meant a supervisor that vanished with an
+        empty log and no way to ask it what happened."""
+        with mock.patch.object(sup, "claim_singleton", lambda: True), \
+             mock.patch.object(sup, "_cycle", lambda b: b), \
+             mock.patch.object(sup.time, "sleep",
+                               mock.Mock(side_effect=RuntimeError("exploded"))), \
+             mock.patch.object(sup, "say") as say, \
+             mock.patch.object(sys, "argv", ["supervisor.py"]):
+            with self.assertRaises(RuntimeError):
+                sup.main()
+        msg = self.messages(say)
+        self.assertIn("supervisor died", msg)
+        self.assertIn("exploded", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

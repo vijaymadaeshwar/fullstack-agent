@@ -25,6 +25,7 @@ import os
 import socket
 import subprocess
 import time
+import traceback
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -671,6 +672,41 @@ def stop() -> None:
         say("stack stopped (brain left running for the other agents)")
 
 
+def _cycle(beat: float) -> float:
+    """One watch iteration: check the stack, rotate the log, heartbeat.
+
+    Every step is guarded separately, and this exists as a function so
+    that can be tested. The loop it replaced ran the FIRST check with no
+    handler at all, while stderr went to a console nobody redirected --
+    so an HTTPError from a dead provider during startup killed the
+    watchdog and left not one word in supervisor.log. That is what the
+    unexplained gaps between "supervisor up" lines were: minutes to hours
+    with nothing on watch and nothing recorded to explain it.
+
+    Returns the heartbeat clock, moved forward when one is written.
+    """
+    try:
+        once()
+    except Exception as e:
+        say(f"check failed, continuing: {type(e).__name__}: {e}")
+    # The voice line's log is the one that grows fast, since it records
+    # every turn and this process does not own it. Rotating it from here
+    # keeps it honest even though backtalk is the writer, and it avoids
+    # adding rotation code to backtalk itself, which is a fork that
+    # should stay close to upstream.
+    try:
+        rotate(BT_LOG)
+    except Exception as e:
+        say(f"rotate failed, continuing: {type(e).__name__}: {e}")
+    # A heartbeat, because silence here is indistinguishable from a dead
+    # process: silence used to mean "nothing needed fixing" and also
+    # "the watcher had been killed".
+    if time.time() - beat >= 600:
+        say("still watching, all quiet")
+        return time.time()
+    return beat
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
@@ -706,30 +742,25 @@ def main() -> int:
         return 0
 
     say("supervisor up, watching brain, face and voice")
-    once()
     beat = time.time()
     try:
+        # Check NOW, before the first sleep: a stack that came up broken
+        # should not have to wait out a poll interval to be repaired, and
+        # this is the call that used to run unprotected.
+        beat = _cycle(beat)
         while True:
             time.sleep(POLL)
-            try:
-                once()
-            except Exception as e:
-                say(f"check failed, continuing: {type(e).__name__}: {e}")
-            # A heartbeat, because silence here is indistinguishable from a
-            # dead process: silence used to mean "nothing needed fixing" and
-            # also "the watcher had been killed".
-            #
-            # The voice line's log is the one that grows fast, since it
-            # records every turn and this process does not own it. Rotating
-            # it from here keeps it honest even though backtalk is the
-            # writer, and it avoids adding rotation code to backtalk itself,
-            # which is a fork that should stay close to upstream.
-            rotate(BT_LOG)
-            if time.time() - beat >= 600:
-                say("still watching, all quiet")
-                beat = time.time()
+            beat = _cycle(beat)
     except KeyboardInterrupt:
         say("supervisor stopped")
+    except BaseException:
+        # Last resort. Everything inside _cycle is already guarded, so
+        # what reaches here is a bug rather than a flaky disk -- and it
+        # would otherwise print to a stderr that `start ""` never
+        # captured, which is how every silent death before this went
+        # unexplained.
+        say(f"supervisor died: {traceback.format_exc()}")
+        raise
     return 0
 
 
