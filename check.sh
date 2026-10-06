@@ -13,6 +13,12 @@ echo ""
 echo "=== backtalk/tests/test_wake.py ==="
 uv run python tests/test_wake.py
 echo ""
+echo "=== backtalk/tests/test_lang_detect.py ==="
+uv run python tests/test_lang_detect.py
+echo ""
+echo "=== backtalk/tests/test_encoding.py ==="
+uv run python tests/test_encoding.py
+echo ""
 echo "=== backtalk/tests/test_stt_langs.py (heavy) ==="
 uv run python tests/test_stt_langs.py
 echo ""
