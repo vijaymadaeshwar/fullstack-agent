@@ -19,6 +19,9 @@ echo ""
 echo "=== backtalk/tests/test_turn_errors.py ==="
 uv run python tests/test_turn_errors.py
 echo ""
+echo "=== backtalk/tests/test_bus_park.py ==="
+uv run python tests/test_bus_park.py
+echo ""
 echo "=== backtalk/tests/test_encoding.py ==="
 uv run python tests/test_encoding.py
 echo ""

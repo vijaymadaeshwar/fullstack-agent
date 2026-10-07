@@ -156,13 +156,56 @@ def _archive_in_place(path: str, keep: int) -> None:
 
 
 def say(msg: str) -> None:
+    """Write a line to the console and to supervisor.log.
+
+    NEVER RAISES, and that is not defensive padding. This is the only
+    record the watchdog leaves, so a failure here is the difference
+    between a diagnosable death and a supervisor that simply stops
+    appearing in its own log while its window vanishes.
+
+    The console write is the hazardous half: stdout is the window
+    autostart.bat opened, and once that window is gone -- or the text
+    cannot be encoded in the console's codepage, which raises
+    UnicodeEncodeError, a ValueError rather than an OSError -- print
+    raises. Every call site assumes say() cannot fail, including the
+    crash handler that would otherwise report it, so the exception has
+    to die here or it takes the whole watchdog with it.
+    """
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    # Rotation and writing are separate on purpose: a log that cannot be
+    # rotated is a log you can still write to, and losing the line
+    # because the archive step hiccuped would be its own quiet failure.
     try:
         rotate(LOG)
-        with open(LOG, "a", encoding="utf-8") as f:
+    except Exception:
+        pass
+    try:
+        # errors="replace": a lone surrogate in an error string used to be
+        # able to fail BOTH halves of this function, console and file
+        # alike, which is a silent death wearing a log line's clothing.
+        with open(LOG, "a", encoding="utf-8", errors="replace") as f:
             f.write(line + "\n")
-    except OSError:
+    except Exception:
+        pass
+
+
+def _last_words(text: str) -> None:
+    """Record a fatal error with the least that can possibly go wrong.
+
+    Deliberately not say(): this runs at the moment say() may itself be
+    the thing that just failed. No console, no rotation, no formatting
+    beyond a timestamp -- one open and one write, each wrapped. If this
+    cannot land, nothing can, and the traceback still goes to stderr.
+    """
+    try:
+        with open(LOG, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"supervisor died: {text}\n")
+    except Exception:
         pass
 
 
@@ -756,10 +799,12 @@ def main() -> int:
     except BaseException:
         # Last resort. Everything inside _cycle is already guarded, so
         # what reaches here is a bug rather than a flaky disk -- and it
-        # would otherwise print to a stderr that `start ""` never
-        # captured, which is how every silent death before this went
-        # unexplained.
-        say(f"supervisor died: {traceback.format_exc()}")
+        # would otherwise land only on a stderr the autostart window
+        # threw away. _last_words rather than say(), because say() is
+        # precisely what may have failed on the way here: believing it
+        # was safe is what turned the last silent death into a log with
+        # no line in it at all.
+        _last_words(traceback.format_exc())
         raise
     return 0
 

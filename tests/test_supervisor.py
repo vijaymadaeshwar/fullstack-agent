@@ -587,18 +587,99 @@ class TestWatchdogSurvivesItsOwnFailures(unittest.TestCase):
     def test_a_crash_is_written_to_the_log_before_it_exits(self):
         """The outer handler, for anything the guards above cannot catch.
         Before it, a bug here meant a supervisor that vanished with an
-        empty log and no way to ask it what happened."""
-        with mock.patch.object(sup, "claim_singleton", lambda: True), \
-             mock.patch.object(sup, "_cycle", lambda b: b), \
-             mock.patch.object(sup.time, "sleep",
-                               mock.Mock(side_effect=RuntimeError("exploded"))), \
-             mock.patch.object(sup, "say") as say, \
-             mock.patch.object(sys, "argv", ["supervisor.py"]):
-            with self.assertRaises(RuntimeError):
-                sup.main()
-        msg = self.messages(say)
-        self.assertIn("supervisor died", msg)
-        self.assertIn("exploded", msg)
+        empty log and no way to ask it what happened.
+
+        Asserted against the log FILE rather than say(): the death this
+        test exists for happened because say() was the thing that
+        failed, so a say() mock would pass on the broken shape."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "supervisor.log")
+            with mock.patch.object(sup, "LOG", log), \
+                 mock.patch.object(sup, "claim_singleton", lambda: True), \
+                 mock.patch.object(sup, "_cycle", lambda b: b), \
+                 mock.patch.object(
+                     sup.time, "sleep",
+                     mock.Mock(side_effect=RuntimeError("exploded"))), \
+                 mock.patch.object(sup, "say"), \
+                 mock.patch.object(sys, "argv", ["supervisor.py"]):
+                with self.assertRaises(RuntimeError):
+                    sup.main()
+            text = Path(log).read_text(encoding="utf-8")
+            self.assertIn("supervisor died", text)
+            self.assertIn("exploded", text)
+
+
+class TestSayCannotKillTheWatchdog(unittest.TestCase):
+    """say() raising took the whole watchdog down and left no line behind.
+
+    stdout is the window autostart.bat opened, so a closed window makes
+    print raise; text outside the console codepage makes it raise
+    UnicodeEncodeError, which is a ValueError and not the OSError the
+    old guard caught. Every call site -- including the crash handler --
+    assumed say() could not fail, so the first failure escaped straight
+    out of the loop and the process was gone with nothing logged."""
+
+    @staticmethod
+    def logged(log):
+        return Path(log).read_text(encoding="utf-8")
+
+    def test_a_dead_console_still_lands_the_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "supervisor.log")
+            with mock.patch.object(sup, "LOG", log), \
+                 mock.patch("builtins.print",
+                            mock.Mock(side_effect=OSError(109, "broken pipe"))):
+                sup.say("watchdog was here")
+            self.assertIn("watchdog was here", self.logged(log))
+
+    def test_an_unencodable_message_still_lands_the_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "supervisor.log")
+            with mock.patch.object(sup, "LOG", log), \
+                 mock.patch("builtins.print",
+                            mock.Mock(side_effect=UnicodeEncodeError(
+                                "cp1252", "x", 0, 1, "not an ordinal"))):
+                sup.say("model némotron \ud800 failed")
+            text = self.logged(log)
+            self.assertIn("model n", text)
+            self.assertIn("failed", text)
+
+    def test_say_survives_a_message_it_cannot_even_encode(self):
+        """No mocks: the real print, with a lone surrogate in the text."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "supervisor.log")
+            with mock.patch.object(sup, "LOG", log):
+                sup.say("bad \ud800 character")        # must not raise
+            self.assertIn("bad", self.logged(log))
+
+    def test_a_failed_rotation_does_not_cost_the_line(self):
+        """A log that cannot be rotated is a log you can still write to.
+        Rotation and writing used to share one try, so a hiccup in the
+        archive step silently ate the line it was about to record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "supervisor.log")
+            with mock.patch.object(sup, "LOG", log), \
+                 mock.patch.object(sup, "rotate",
+                                   mock.Mock(side_effect=ValueError("x"))), \
+                 mock.patch("builtins.print",
+                            mock.Mock(side_effect=OSError("x"))):
+                sup.say("still alive")                  # must not raise
+            self.assertIn("still alive", self.logged(log))
+
+    def test_last_words_writes_without_say(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "supervisor.log")
+            with mock.patch.object(sup, "LOG", log), \
+                 mock.patch.object(sup, "say") as say:
+                sup._last_words("Traceback: exploded")
+            say.assert_not_called()                     # say is the suspect
+            self.assertIn("supervisor died: Traceback: exploded",
+                          self.logged(log))
+
+    def test_last_words_survives_an_unwritable_log(self):
+        with mock.patch.object(sup, "LOG",
+                               os.path.join("Z:", "\\", "no", "dir", "x.log")):
+            sup._last_words("traceback")                # must not raise
 
 
 if __name__ == "__main__":
